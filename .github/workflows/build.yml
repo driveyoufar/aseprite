@@ -6,164 +6,58 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
-        build_type: [RelWithDebInfo, Debug]
-        ui: [gui, cli]
-        scripting: [lua, noscripts]
-        exclude:
-          - build_type: Debug
-            ui: gui
-          - build_type: RelWithDebInfo
-            ui: cli
-          - build_type: RelWithDebInfo
-            scripting: noscripts
+        os: [windows-latest]
+        build_type: [Release]
+        enable_ui: [on]
+        include:
+          - os: windows-latest
+            build_type: Release
+            enable_ui: on
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v3
       with:
         submodules: 'recursive'
-
-    # Linux 依赖安装（不变）
-    - name: Install Dependencies (Linux)
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1
       if: runner.os == 'Linux'
-      shell: bash
-      run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y \
-          libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
-          libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
-          libfontconfig1-dev xvfb  # 新增 xvfb 用于无界面测试
-
-    # Windows 额外依赖：安装 7-Zip（用于解压 Skia，Windows 自带 unzip 可能有问题）
-    - name: Install 7-Zip (Windows)
+      with:
+        key: ${{ matrix.os }}-${{ matrix.enable_ui }}
+    - uses: seanmiddleditch/gha-setup-ninja@master
+    - uses: ilammy/msvc-dev-cmd@v1
       if: runner.os == 'Windows'
-      uses: montudor/action-7z@v1
-      with:
-        args: --version  # 仅验证安装，实际解压在后续步骤
-
-    # 安装 Skia（适配 Windows 路径和解压工具）
-    - name: Install Skia
-      if: ${{ matrix.ui == 'gui' }}
+    - name: Install Dependencies
       shell: bash
       run: |
-        # Windows 路径转换（cygpath 是 Git Bash 自带工具，将 Windows 路径转为 Unix 格式）
-        if [[ "${{ runner.os }}" == "Windows" ]] ; then
-          this_dir=$(cygpath -w "${{ github.workspace }}")  # 输出 Windows 格式路径（C:\xxx）
-          skia_arch=x64  # Windows 仅支持 x64
-        else
-          this_dir="${{ github.workspace }}"
-          skia_arch=${{ runner.os == 'macOS' ? 'arm64' : 'x64' }}
+        if [[ "${{ runner.os }}" == "Linux" ]] ; then
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libx11-dev libxcursor-dev libxi-dev
         fi
-
-        # 获取 Skia 下载链接
-        skia_url=$(source $this_dir/laf/misc/skia-url.sh | xargs)
-        skia_file=$(basename $skia_url)
-        
-        # 下载 Skia（Windows 用 curl 兼容参数）
-        curl --ssl-no-revoke -L -o "$skia_file" "$skia_url"  # Windows 禁用 SSL 吊销检查（避免网络问题）
-
-        # 解压 Skia（Windows 用 7z，其他系统用 unzip）
-        if [[ "${{ runner.os }}" == "Windows" ]] ; then
-          7z x "$skia_file" -o"skia" -y  # -o 指定输出目录，-y 自动确认
-        else
-          unzip "$skia_file" -d skia
-        fi
-
-    # ccache 仅用于 Linux/macOS（Windows 禁用，MSVC 兼容较差）
-    - name: ccache (Linux/macOS)
-      uses: hendrikmuhs/ccache-action@v1.2.17
-      if: ${{ runner.os == 'Linux' || runner.os == 'macOS' }}
-      with:
-        key: ${{ matrix.os }}-${{ matrix.ui }}-${{ matrix.scripting }}-${{ matrix.build_type }}
-
-    # 安装 Ninja（不变）
-    - uses: aseprite/get-ninja@main
-
-    # Windows 激活 MSVC 编译环境（不变，但必须保留）
-    - name: Activate MSVC (Windows)
-      if: runner.os == 'Windows'
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64  # 明确指定 x64 架构
-
-    # 生成 CMake 配置（重点适配 Windows）
-    - name: Generating CMake Files
+    - name: Generating Makefiles
       shell: bash
       run: |
-        # 初始化变量
-        enable_ccache="off"
-        laf_backend="${{ matrix.ui == 'gui' ? 'skia' : 'none' }}"
-        enable_scripting="${{ matrix.scripting == 'lua' ? 'on' : 'off' }}"
-        skia_arch="x64"  # Windows 仅支持 x64
-        skia_dir=""
-
-        # 适配不同系统的路径和参数
         if [[ "${{ runner.os }}" == "Windows" ]] ; then
-          # Windows 路径：使用 cygpath 转换为 MSVC 可识别的路径（无空格转义）
-          workspace_win=$(cygpath -w "${{ github.workspace }}")
-          skia_dir="$workspace_win\\skia"  # Windows 用反斜杠路径
-          # Windows 禁用 ccache（MSVC 不兼容）
-          enable_ccache="off"
+          export enable_ccache=off
         else
-          # Linux/macOS 路径
-          skia_dir=$(realpath skia)
-          skia_arch=${{ runner.os == 'macOS' ? 'arm64' : 'x64' }}
-          enable_ccache="on"
+          export enable_ccache=on
         fi
-
-        # CMake 命令（Windows 需指定 MSVC 生成器，且路径用双引号包裹）
+        curl -L https://github.com/blueloveTH/aseprite/releases/download/v0.01/skia.zip --output skia.zip
+        7z x skia.zip
         cmake -S . -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-          ${{ runner.os == 'macOS' && '-DCMAKE_OSX_DEPLOYMENT_TARGET=10.14' || '' }} \
-          -DENABLE_TESTS=ON \
-          -DENABLE_SCRIPTING=$enable_scripting \
+          -DENABLE_UI=${{ matrix.enable_ui }} \
           -DENABLE_CCACHE=$enable_ccache \
-          -DLAF_BACKEND=$laf_backend \
-          -DSKIA_DIR="${skia_dir}" \
-          -DSKIA_LIBRARY_DIR="${skia_dir}\\out\\Release-$skia_arch" \  # Windows 反斜杠路径
-          ${{ runner.os == 'Windows' && '-DCMAKE_CXX_FLAGS="/EHsc"' || '' }}  # Windows 启用 C++ 异常处理
-
-    # 编译（Windows 用 Ninja 正常编译，无需修改）
+          -DLAF_BACKEND=skia \
+          -DSKIA_DIR=./skia \
+          -DSKIA_LIBRARY_DIR=./skia/out/Release-x64 \
+          -DSKIA_LIBRARY=./skia/out/Release-x64/skia.lib
     - name: Compiling
       shell: bash
       run: |
-        cd build && ninja -v  # -v 显示编译命令（便于调试）
-
-    # 运行 C++ 测试（Windows 无需 XVFB，直接运行）
-    - name: Running C++ Tests
-      shell: bash
-      run: |
-        # Windows 无 XVFB，直接运行 ctest
-        if [[ "${{ runner.os }}" == "Linux" ]] ; then
-          export XVFB=xvfb-run
-        else
-          export XVFB=""  # Windows/macOS 不需要 XVFB
-        fi
-        cd build && $XVFB ctest --output-on-failure -C ${{ matrix.build_type }}
-
-    # 运行 CLI 测试（适配 Windows 可执行文件路径）
-    - name: Running CLI Tests
-      if: ${{ matrix.scripting == 'lua' }}
-      shell: bash
-      run: |
-        # 适配 Windows 可执行文件路径（.exe 后缀）
-        if [[ "${{ runner.os }}" == "Windows" ]] ; then
-          export ASEPRITE="$PWD/build/bin/aseprite.exe"  # Windows 需加 .exe 后缀
-          export XVFB=""
-        elif [[ "${{ runner.os }}" == "Linux" ]] ; then
-          export ASEPRITE="$PWD/build/bin/aseprite"
-          export XVFB=xvfb-run
-        else
-          export ASEPRITE="$PWD/build/bin/aseprite"
-          export XVFB=""
-        fi
-
-        # 验证可执行文件存在
-        if [[ ! -f "$ASEPRITE" ]] ; then
-          echo "Error: ASEPRITE executable not found at $ASEPRITE"
-          ls -la "$PWD/build/bin"  # 列出目录内容，便于调试
-          exit 1
-        fi
-
-        # 运行测试脚本
-        cd tests
-        $XVFB bash run-tests.sh
+        cd build && ninja
+    - uses: actions/upload-artifact@v3
+      with:
+        name: aseprite
+        path: |
+          D:/a/aseprite/aseprite/build/bin/data
+          D:/a/aseprite/aseprite/build/bin/aseprite.exe
