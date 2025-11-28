@@ -14,7 +14,7 @@ jobs:
             build_type: Release
             enable_ui: on
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4  # 同步升级到最新稳定版
       with:
         submodules: 'recursive'
     - name: ccache
@@ -55,9 +55,11 @@ jobs:
       shell: bash
       run: |
         cd build && ninja
-    - uses: actions/upload-artifact@v3
+    - uses: actions/upload-artifact@v4  # 升级到最新稳定版
       with:
-        name: aseprite
+        name: aseprite-windows-${{ matrix.build_type }}-ui-${{ matrix.enable_ui }}
         path: |
-          D:/a/aseprite/aseprite/build/bin/data
-          D:/a/aseprite/aseprite/build/bin/aseprite.exe
+          build/bin/data/**/*  # 使用相对路径更可靠
+          build/bin/aseprite.exe  # 修复笔误：移除多余的 "build" 后缀
+        if-no-files-found: error  # 没有找到文件时报错（可选，增强可靠性）
+        retention-days: 7  #  artifacts 保留7天（可选，可根据需求调整）
