@@ -14,17 +14,22 @@ jobs:
             build_type: Release
             enable_ui: on
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4  # 升级到最新版，修复子模块拉取问题
       with:
         submodules: 'recursive'
+        fetch-depth: 1  # 加速拉取
+
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1
       if: runner.os == 'Linux'
       with:
         key: ${{ matrix.os }}-${{ matrix.enable_ui }}
+
     - uses: seanmiddleditch/gha-setup-ninja@master
+
     - uses: ilammy/msvc-dev-cmd@v1
       if: runner.os == 'Windows'
+
     - name: Install Dependencies
       shell: bash
       run: |
@@ -33,6 +38,30 @@ jobs:
           sudo apt-get install -y \
             libx11-dev libxcursor-dev libxi-dev
         fi
+        # Windows 安装 7-Zip（确保解压工具可用）
+        if [[ "${{ runner.os }}" == "Windows" ]] ; then
+          choco install 7zip -y --no-progress
+          echo "C:\Program Files\7-Zip" >> $GITHUB_PATH
+        fi
+
+    - name: Download & Extract Skia
+      shell: bash
+      run: |
+        # 使用 Aseprite 官方 Skia 包（m102 版本，适配 Windows x64）
+        SKIA_URL="https://github.com/aseprite/skia/releases/download/m102-861e4743af/Skia-Windows-Release-x64.zip"
+        curl -L --retry 5 --output skia.zip "$SKIA_URL"  # 增加重试机制
+        
+        # 验证 ZIP 文件完整性（避免下载损坏）
+        if ! 7z t skia.zip > /dev/null; then
+          echo "Skia ZIP 文件损坏，重新下载..."
+          rm skia.zip
+          curl -L --retry 5 --output skia.zip "$SKIA_URL"
+          7z t skia.zip || exit 1  # 再次验证失败则退出
+        fi
+        
+        # 解压到 skia 目录（确保目录结构正确）
+        7z x skia.zip -o./skia -y  # -o 指定输出目录，-y 自动确认
+
     - name: Generating Makefiles
       shell: bash
       run: |
@@ -41,23 +70,36 @@ jobs:
         else
           export enable_ccache=on
         fi
-        curl -L https://github.com/aseprite/skia/releases/download/m102-861e4743af/Skia-Windows-Release-x64.zip
-        7z x skia.zip
+        # 关键：使用相对路径，避免 Windows 路径分隔符问题
         cmake -S . -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
           -DENABLE_UI=${{ matrix.enable_ui }} \
           -DENABLE_CCACHE=$enable_ccache \
           -DLAF_BACKEND=skia \
-          -DSKIA_DIR=./skia \
-          -DSKIA_LIBRARY_DIR=./skia/out/Release-x64 \
-          -DSKIA_LIBRARY=./skia/out/Release-x64/skia.lib
+          -DSKIA_DIR="${PWD}/skia" \  # 绝对路径+相对路径组合，确保正确性
+          -DSKIA_LIBRARY_DIR="${PWD}/skia/out/Release-x64" \
+          -DSKIA_LIBRARY="${PWD}/skia/out/Release-x64/skia.lib" \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache  # 显式指定 ccache（Linux 用）
+
     - name: Compiling
       shell: bash
       run: |
-        cd build && ninja
+        cd build && ninja -j2  # 限制并发数，避免 Windows 资源耗尽
+
+    - name: Verify Build Output
+      shell: bash
+      run: |
+        # 检查编译产物是否存在
+        if [[ ! -f "build/bin/aseprite.exe" ]]; then
+          echo "编译失败：aseprite.exe 未生成"
+          exit 1
+        fi
+        echo "编译成功！产物路径：$(realpath build/bin/aseprite.exe)"
+
     - uses: actions/upload-artifact@v4
       with:
-        name: aseprite
+        name: aseprite-windows-${{ matrix.build_type }}
         path: |
-          D:/a/aseprite/aseprite/build/bin/data
-          D:/a/aseprite/aseprite/build/bin/aseprite.exe
+          build/bin/aseprite.exe
+          build/bin/data/
+        retention-days: 7  # 可选：设置产物保留时间
