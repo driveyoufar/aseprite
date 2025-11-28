@@ -1,138 +1,110 @@
-name: Windows Build
+name: build
 on: [push, pull_request]
 jobs:
-  build-windows:
-    runs-on: windows-latest  # 仅使用Windows runner
+  build:
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # 仅保留Windows支持的组合（按原逻辑过滤无效组合）
-        build_type: [RelWithDebInfo, Debug]
+        os: [windows-latest]
+        build_type: [Release]
         ui: [gui, cli]
         scripting: [lua, noscripts]
         exclude:
           - build_type: Debug
-            ui: gui          # Debug模式不编译GUI
+            ui: gui
           - build_type: RelWithDebInfo
-            ui: cli          # Release模式不编译CLI
+            ui: cli
           - build_type: RelWithDebInfo
-            scripting: noscripts  # Release模式强制开启脚本
+            scripting: noscripts
     steps:
-      # 1. 拉取代码（含子模块，Aseprite依赖laf等子模块）
-      - uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
-          fetch-depth: 1  # 加快拉取速度（无需完整历史）
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+    - name: Install Dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y \
+          libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+          libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
+          libfontconfig1-dev
+    - name: Install Skia
+      if: ${{ matrix.ui == 'gui' }}
+      shell: bash
+      run: |
+        if [[ "${{ runner.os }}" == "Windows" ]] ; then
+          this_dir=$(cygpath "${{ github.workspace }}")
+        else
+          this_dir="${{ github.workspace }}"
+        fi
+        skia_url=$(source $this_dir/laf/misc/skia-url.sh | xargs)
+        skia_file=$(basename $skia_url)
+        curl --ssl-revoke-best-effort -L -o "$skia_file" "$skia_url"
+        unzip "$skia_file" -d skia
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2.17
+      if: ${{ runner.os == 'Linux' || runner.os == 'macOS' }}
+      with:
+        key: ${{ matrix.os }}-${{ matrix.ui }}-${{ matrix.scripting }}-${{ matrix.build_type }}
+    - uses: aseprite/get-ninja@main
+    - uses: ilammy/msvc-dev-cmd@v1
+      if: runner.os == 'Windows'
+    - name: Generating Makefiles
+      shell: bash
+      run: |
+        if [[ "${{ runner.os }}" == "Windows" ]] ; then
+          export enable_ccache=off
+        else
+          export enable_ccache=on
+        fi
 
-      # 2. 下载Skia（仅GUI模式需要，Windows专属预编译包）
-      - name: Install Skia (GUI Mode)
-        if: ${{ matrix.ui == 'gui' }}
-        shell: bash  # Windows用Git Bash执行（更兼容Linux命令）
-        run: |
-          # Windows路径转换（避免反斜杠冲突）
-          this_dir=$(cygpath -w "${{ github.workspace }}" | sed 's/\\/\//g')
-          
-          # 从laf脚本获取Windows对应的Skia下载链接（保证版本匹配）
-          skia_url=$(source "$this_dir/laf/misc/skia-url.sh" | xargs)
-          skia_file=$(basename "$skia_url")
-          echo "Downloading Skia from: $skia_url"
+        if [[ "${{ matrix.ui }}" == "gui" ]] ; then
+          export laf_backend=skia
+        else
+          export laf_backend=none
+        fi
 
-          # 下载Skia（增加重试和超时，避免网络波动）
-          curl -L --retry 3 --connect-timeout 30 -o "$skia_file" "$skia_url"
+        if [[ "${{ matrix.scripting }}" == "lua" ]] ; then
+          export enable_scripting=on
+        else
+          export enable_scripting=off
+        fi
 
-          # 校验Skia文件完整性（至少100MB，避免下载损坏）
-          if [ ! -s "$skia_file" ] || [ $(wc -c < "$skia_file") -lt 104857600 ]; then
-            echo "Error: Skia file is too small or empty (download failed)"
-            exit 1
-          fi
+        if [[ "${{ runner.os }}" == "macOS" ]] ; then
+          export skia_arch=arm64
+        else
+          export skia_arch=x64
+        fi
 
-          # Windows用7z解压（GitHub runner自带7z）
-          7z x "$skia_file" -d skia > /dev/null
-          echo "Skia extracted to: $PWD/skia"
-
-      # 3. 安装Ninja构建工具（Aseprite推荐用Ninja加速编译）
-      - uses: aseprite/get-ninja@main
-
-      # 4. 配置MSVC环境（Windows编译C++必需，生成VS编译工具链）
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64  # 强制64位编译（Aseprite Windows版仅支持x64）
-
-      # 5. 生成CMake构建文件（Windows专属配置）
-      - name: Generate CMake Build Files
-        shell: bash
-        run: |
-          # Windows不支持ccache，强制关闭
-          enable_ccache=off
-
-          # 配置UI后端（GUI用Skia，CLI用none）
-          if [[ "${{ matrix.ui }}" == "gui" ]]; then
-            laf_backend=skia
-          else
-            laf_backend=none
-          fi
-
-          # 配置Lua脚本支持
-          if [[ "${{ matrix.scripting }}" == "lua" ]]; then
-            enable_scripting=on
-          else
-            enable_scripting=off
-          fi
-
-          # 构建CMake参数（Windows专属路径和配置）
-          cmake_args=(
-            -S . -B build -G Ninja
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}  # 构建类型（Release/Debug）
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.14  # 兼容macOS（不影响Windows，保留不报错）
-            -DENABLE_TESTS=ON  # 启用测试（可选，可改为OFF关闭）
-            -DENABLE_SCRIPTING=$enable_scripting
-            -DENABLE_CCACHE=$enable_ccache
-            -DLAF_BACKEND=$laf_backend
-            -DCMAKE_CXX_FLAGS="/W4 /WX"  # Windows额外编译选项（警告视为错误，可选）
-          )
-
-          # 仅GUI模式添加Skia路径（Windows用相对路径，避免空格和反斜杠问题）
-          if [[ "${{ matrix.ui }}" == "gui" ]]; then
-            skia_dir="$PWD/skia"
-            skia_lib_dir="$skia_dir/out/Release-x64"  # Windows Skia仅x64
-            cmake_args+=(
-              -DSKIA_DIR="$skia_dir"
-              -DSKIA_LIBRARY_DIR="$skia_lib_dir"
-              -DSKIA_LIBRARY="$skia_lib_dir/skia.lib"  # 显式指定Skia库文件（避免CMake找不到）
-            )
-          fi
-
-          # 执行CMake（打印参数便于调试）
-          echo "CMake Args: ${cmake_args[*]}"
-          "${cmake_args[@]}"
-
-      # 6. 编译项目（用Ninja加速，Windows多核心编译）
-      - name: Compile Aseprite
-        shell: bash
-        run: |
-          cd build
-          ninja -j$(nproc)  # 用所有CPU核心编译（Windows runner通常4核，加速明显）
-
-      # 7. 运行测试（Windows专属适配，仅支持C++测试，CLI测试暂关闭）
-      - name: Run C++ Tests
-        shell: bash
-        run: |
-          cd build
-          # Windows无xvfb，直接运行测试（GUI测试在Windows有界面，runner会自动处理）
-          ctest --output-on-failure -j$(nproc)
-
-      # 8. 上传Windows编译产物（方便下载使用）
-      - name: Upload Windows Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          # 产物名称含构建信息（便于区分）
-          name: aseprite-windows-${{ matrix.build_type }}-${{ matrix.ui }}-${{ matrix.scripting }}
-          # 上传编译后的二进制文件和资源（Windows运行必需）
-          path: |
-            build/bin/aseprite.exe
-            build/bin/data/  # 资源文件（图标、配置等，必需）
-            build/bin/*.dll  # 依赖的动态库（如Skia、Lua等）
-          # 保留产物30天（可调整）
-          retention-days: 30
-          # 压缩产物（减小下载体积）
-          compression-level: maximum
+        cmake -S . -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.14 \
+          -DENABLE_TESTS=ON \
+          -DENABLE_SCRIPTING=$enable_scripting \
+          -DENABLE_CCACHE=$enable_ccache \
+          -DLAF_BACKEND=$laf_backend \
+          -DSKIA_DIR=$(realpath skia) \
+          -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
+    - name: Compiling
+      shell: bash
+      run: |
+        cd build && ninja
+    - name: Running C++ Tests
+      shell: bash
+      run: |
+        if [[ "${{ runner.os }}" == "Linux" ]] ; then
+          export XVFB=xvfb-run
+        fi
+        cd build && $XVFB ctest --output-on-failure
+    - name: Running CLI Tests
+      if: ${{ matrix.scripting == 'lua' }}
+      shell: bash
+      run: |
+        if [[ "${{ runner.os }}" == "Linux" ]] ; then
+          export XVFB=xvfb-run
+        fi
+        export ASEPRITE=$PWD/build/bin/aseprite
+        cd tests
+        $XVFB bash run-tests.sh
