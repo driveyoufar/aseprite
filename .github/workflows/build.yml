@@ -14,52 +14,109 @@ jobs:
             build_type: Release
             enable_ui: on
     steps:
-    - uses: actions/checkout@v4  # 同步升级到最新稳定版
+    - uses: actions/checkout@v4
       with:
         submodules: 'recursive'
-    - name: ccache
-      uses: hendrikmuhs/ccache-action@v1
-      if: runner.os == 'Linux'
-      with:
-        key: ${{ matrix.os }}-${{ matrix.enable_ui }}
+        fetch-depth: 0  # 确保完整拉取仓库（避免子模块缺失）
+
     - uses: seanmiddleditch/gha-setup-ninja@master
+      with:
+        version: 1.11.1  # 指定稳定版本（避免兼容问题）
+
     - uses: ilammy/msvc-dev-cmd@v1
       if: runner.os == 'Windows'
-    - name: Install Dependencies
+      with:
+        arch: x64  # 明确指定 64 位架构（匹配 Skia 的 Release-x64）
+
+    - name: 安装 7-Zip（解压 Skia）
+      if: runner.os == 'Windows'
+      uses: montudor/action-7z@v1  # 确保 7-Zip 可用（避免系统缺少）
+
+    - name: 下载并解压 Skia
       shell: bash
       run: |
-        if [[ "${{ runner.os }}" == "Linux" ]] ; then
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            libx11-dev libxcursor-dev libxi-dev
+        # 打印当前目录和文件列表（调试用）
+        echo "当前目录: $(pwd)"
+        ls -la
+        
+        # 下载 Skia（添加超时和重试）
+        echo "开始下载 Skia..."
+        curl -L --retry 3 --connect-timeout 30 https://github.com/blueloveTH/aseprite/releases/download/v0.01/skia.zip --output skia.zip
+        
+        # 验证文件是否下载成功
+        if [ ! -f "skia.zip" ]; then
+          echo "错误：Skia 下载失败！"
+          exit 1
         fi
-    - name: Generating Makefiles
+        echo "Skia 下载大小: $(du -sh skia.zip)"
+        
+        # 解压 Skia（显示进度，避免静默失败）
+        echo "开始解压 Skia..."
+        7z x skia.zip -aoa -o./skia  # -aoa 覆盖已存在文件，-o 指定输出目录
+        echo "解压完成，Skia 目录内容："
+        ls -la ./skia
+        ls -la ./skia/out/Release-x64  # 验证核心库是否存在
+
+    - name: 生成 CMake 构建文件
       shell: bash
       run: |
-        if [[ "${{ runner.os }}" == "Windows" ]] ; then
-          export enable_ccache=off
-        else
-          export enable_ccache=on
+        # 明确指定 Windows 下的编译器和架构
+        export CMAKE_GENERATOR=Ninja
+        export CMAKE_CXX_COMPILER=cl.exe
+        export CMAKE_C_COMPILER=cl.exe
+        
+        # 创建 build 目录（确保目录存在）
+        mkdir -p build
+        cd build
+        
+        # 打印 Skia 库路径（调试用）
+        echo "Skia 库路径: $(pwd)/../skia/out/Release-x64/skia.lib"
+        if [ ! -f "../skia/out/Release-x64/skia.lib" ]; then
+          echo "错误：Skia 库文件不存在！"
+          exit 1
         fi
-        curl -L https://github.com/blueloveTH/aseprite/releases/download/v0.01/skia.zip --output skia.zip
-        7z x skia.zip
-        cmake -S . -B build -G Ninja \
+        
+        # 执行 CMake（添加详细日志）
+        echo "开始生成 CMake 配置..."
+        cmake -S .. -B . -G Ninja \
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
           -DENABLE_UI=${{ matrix.enable_ui }} \
-          -DENABLE_CCACHE=$enable_ccache \
+          -DENABLE_CCACHE=off \  # Windows 下禁用 ccache（避免兼容问题）
           -DLAF_BACKEND=skia \
-          -DSKIA_DIR=./skia \
-          -DSKIA_LIBRARY_DIR=./skia/out/Release-x64 \
-          -DSKIA_LIBRARY=./skia/out/Release-x64/skia.lib
-    - name: Compiling
+          -DSKIA_DIR=../skia \
+          -DSKIA_LIBRARY_DIR=../skia/out/Release-x64 \
+          -DSKIA_LIBRARY=../skia/out/Release-x64/skia.lib \
+          -DCMAKE_SYSTEM_NAME=Windows \
+          -DCMAKE_SYSTEM_PROCESSOR=x64 \
+          -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON  # 修复运行时路径问题
+        
+        # 验证 CMake 生成是否成功
+        if [ ! -f "build.ninja" ]; then
+          echo "错误：CMake 生成失败！"
+          cat CMakeCache.txt  # 输出缓存文件（调试用）
+          exit 1
+        fi
+
+    - name: 编译项目
       shell: bash
       run: |
-        cd build && ninja
-    - uses: actions/upload-artifact@v4  # 升级到最新稳定版
+        cd build
+        # 打印 ninja 构建文件内容（调试用）
+        echo "Ninja 构建文件前 50 行："
+        head -50 build.ninja
+        
+        # 执行编译（添加 -v 显示详细命令，便于排查错误）
+        echo "开始编译..."
+        ninja -v  # -v 显示编译命令，遇到错误时能看到具体问题
+        echo "编译完成，输出目录内容："
+        ls -la bin/  # 验证产物是否生成
+
+    - name: 上传构建产物
+      uses: actions/upload-artifact@v4
       with:
         name: aseprite-windows-${{ matrix.build_type }}-ui-${{ matrix.enable_ui }}
         path: |
-          build/bin/data/**/*  # 使用相对路径更可靠
-          build/bin/aseprite.exe  # 修复笔误：移除多余的 "build" 后缀
-        if-no-files-found: error  # 没有找到文件时报错（可选，增强可靠性）
-        retention-days: 7  #  artifacts 保留7天（可选，可根据需求调整）
+          build/bin/data/**/*
+          build/bin/aseprite.exe
+        if-no-files-found: error
+        retention-days: 7
